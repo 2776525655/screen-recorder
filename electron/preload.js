@@ -4,6 +4,7 @@ contextBridge.exposeInMainWorld('screenRec', {
   recTempCreate: () => ipcRenderer.invoke('rec:temp-create'),
   recTempAppend: (p) => ipcRenderer.invoke('rec:temp-append', p),
   recTempStat: (p) => ipcRenderer.invoke('rec:temp-stat', p),
+  recTempHasMoov: (p) => ipcRenderer.invoke('rec:temp-has-moov', p),
   recTempRemove: (p) => ipcRenderer.invoke('rec:temp-remove', p),
   recTempSave: (p) => ipcRenderer.invoke('rec:temp-save', p),
   recDebugRetain: (p) => ipcRenderer.invoke('rec:debug-retain', p),

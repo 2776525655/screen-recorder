@@ -948,7 +948,6 @@ app.whenReady().then(() => {
       .catch(() => {})
   }, 2000)
 
-  // 自测模式
   if (process.env.SCREENREC_SELF_TEST) {
     const origShow = showWidget
     const wait = setInterval(() => {

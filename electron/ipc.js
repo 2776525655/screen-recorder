@@ -129,6 +129,17 @@ function registerIpc({ setState } = {}) {
     }
   })
 
+  // 校验文件是否已写入完整 mp4 索引（moov 在尾部），避免收尾竞态复制出残缺文件
+  ipcMain.handle('rec:temp-has-moov', (_e, { filePath }) => {
+    try {
+      if (!filePath || !fs.existsSync(filePath)) return { ok: false, hasMoov: false }
+      const buf = fs.readFileSync(filePath)
+      return { ok: true, hasMoov: buf.includes(Buffer.from('moov')) }
+    } catch (_) {
+      return { ok: false, hasMoov: false }
+    }
+  })
+
   ipcMain.handle('rec:temp-remove', (_e, { filePath }) => {
     try {
       if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath)

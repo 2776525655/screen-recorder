@@ -501,6 +501,17 @@ async function doExport(filePath) {
       realMuxer.finalize()
     } catch (_) {}
     await state.p.catch(() => {})
+    // 等待文件索引(moov)真正落盘，避免主进程复制到残缺文件
+    let hasMoov = false
+    for (let i = 0; i < 20 && !hasMoov; i++) {
+      const h = await screenRec.recTempHasMoov({ filePath }).catch(() => ({ hasMoov: false }))
+      hasMoov = !!(h && h.hasMoov)
+      if (!hasMoov) await sleep(120)
+    }
+    if (!hasMoov) {
+      log('导出异常：moov 未落盘')
+      return done(false, { message: '导出未完成（文件索引缺失），请重试' })
+    }
     const st = await screenRec.recTempStat({ filePath }).catch(() => ({ size: 0 }))
     done(true, { size: st && st.size ? st.size : 0 })
     log('导出完成 size=' + (st && st.size))

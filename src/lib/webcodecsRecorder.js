@@ -440,6 +440,16 @@ export class Mp4Recorder {
         s.micStream.getTracks().forEach((t) => t.stop())
       } catch (_) {}
     }
+    // 确保 mp4 索引(moov)已落盘，避免后续复制/播放得到残缺文件
+    let hasMoov = false
+    for (let i = 0; i < 20 && !hasMoov; i++) {
+      const h = await window.screenRec
+        .recTempHasMoov({ filePath: s.tmpPath })
+        .catch(() => ({ hasMoov: false }))
+      hasMoov = !!(h && h.hasMoov)
+      if (!hasMoov) await new Promise((r) => setTimeout(r, 120))
+    }
+    if (!hasMoov && !this._writeError) this._writeError = '文件索引未完整写入（moov），请重试'
     const st = await window.screenRec
       .recTempStat({ filePath: s.tmpPath })
       .catch(() => ({ size: 0 }))
@@ -450,6 +460,7 @@ export class Mp4Recorder {
       width: s.width,
       height: s.height,
       audio: s.audioEnabled,
+      moovOk: hasMoov,
       writeError: this._writeError || null,
     }
   }

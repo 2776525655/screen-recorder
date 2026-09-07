@@ -409,6 +409,11 @@ export function useRecorder() {
         toast('录制内容为空，未保存', 'warning')
         return
       }
+      if (info.moovOk === false) {
+        try { await window.screenRec?.recTempRemove({ filePath: info.filePath }) } catch (_) {}
+        toast('录制文件索引未完整写入，本次未保存，请重试', 'error')
+        return
+      }
       // 诊断留存：把原始临时文件复制一份，供排查"无法播放"问题
       try {
         await window.screenRec?.recDebugRetain({ filePath: info.filePath })
