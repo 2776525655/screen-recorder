@@ -9,6 +9,7 @@ directories:
 files:
   - dist/**
   - dist-electron/**
+  - settings.html
   - package.json
   - node_modules/koffi/**
   - "!**/*.map"

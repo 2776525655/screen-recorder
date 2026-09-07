@@ -6,6 +6,22 @@ const { registerIpc, cleanupTempDir } = require('./ipc')
 const { ReplayEngine } = require('./engine/replay')
 const { CursorSource } = require('./cursor')
 
+// 限制每个渲染进程的 V8 堆上限，并暴露 GC，让采集页/Widget 主动回收内存，
+// 避免长时间运行时 working set 缓慢膨胀
+try {
+  app.commandLine.appendSwitch('js-flags', '--expose-gc --max-old-space-size=256 --max-semi-space-size=16')
+} catch (_) {}
+
+// 便携绿色模式：数据全部跟随 portable exe 所在目录（<exe目录>/Data），
+// 不写 C 盘 AppData——设置、分段缓存、默认成片都在这一个文件夹里。
+// 安装版(Setup/win-unpacked)无该环境变量，保持原有系统目录行为。
+if (process.env.PORTABLE_EXECUTABLE_DIR) {
+  try {
+    app.setPath('userData', path.join(process.env.PORTABLE_EXECUTABLE_DIR, 'Data'))
+    fs.mkdirSync(app.getPath('userData'), { recursive: true })
+  } catch (_) {}
+}
+
 // 后台常驻模式：开机自启带 --hidden，不创建 UI 窗口，仅托盘 + 自动记忆回放（Xbox 式）
 const AUTO_HIDDEN = process.argv.includes('--hidden')
 // 注意：不能禁用硬件加速——DXGI 桌面采集与 H.264 编码依赖 GPU/加速管线
@@ -31,8 +47,24 @@ const CLOSE_BLOCK_STATES = ['recording', 'paused', 'saving']
 
 // 记忆回放引擎
 const replayEngine = new ReplayEngine({ root: app.getAppPath() })
-let replayCacheDir = ''
-let pruneTimer = null
+// 磁盘分段缓存（每 2s 一段独立 mp4，仅保留最近 keepSec，内存恒定）
+let replaySegs = [] // { file, startUs, endUs }
+let replayPruneTimer = null
+let replayExportBusy = false // 拼接期间暂停清理，防止读到半删文件
+/** 分段缓存目录：默认 C 盘用户数据；设置里可改到别的盘。
+ *  始终使用所选目录下的独立子目录 screenrec-replay-cache，避免误清用户文件 */
+function replayCachePath() {
+  const s = readSettingsObj()
+  if (s && s.replayCacheDir && typeof s.replayCacheDir === 'string' && s.replayCacheDir.trim()) {
+    return path.join(s.replayCacheDir.trim(), 'screenrec-replay-cache')
+  }
+  return path.join(app.getPath('userData'), 'replay-cache')
+}
+function clearReplayCacheDir() {
+  try {
+    fs.rmSync(replayCachePath(), { recursive: true, force: true })
+  } catch (_) {}
+}
 
 // —— 工具 ——
 function ffmpegExePath() {
@@ -94,8 +126,8 @@ function fmtDur(sec) {
 function notice(message, type = 'info') {
   if (widgetWindow && !widgetWindow.isDestroyed()) {
     widgetWindow.webContents.send('app:notice', { message, type })
-  } else if (AUTO_HIDDEN) {
-    // 后台常驻无窗口：用系统通知提示
+  } else {
+    // 无窗口（后台常驻/收进托盘）时用系统通知提示
     try {
       new Notification({
         title: type === 'error' ? '屏刻 · 出错' : '屏刻 ScreenRec',
@@ -149,9 +181,112 @@ function replayState() {
 }
 
 function stopPruneLoop() {
-  if (pruneTimer) {
-    clearInterval(pruneTimer)
-    pruneTimer = null
+  if (replayPruneTimer) {
+    clearInterval(replayPruneTimer)
+    replayPruneTimer = null
+  }
+}
+
+// —— 内存看护：总占用超过阈值时做轻量回收，不影响记忆录屏缓冲 ——
+const MEM_TRIM_MB = 150 // 用户要求：超过 150MB 自动回收
+let memWatchTimer = null
+let lastMemTrimAt = 0
+let lastTrimTotal = 0
+/** 调用 Windows EmptyWorkingSet 把所有 Electron 进程的不活跃工作集页踢回页面文件
+ *  等价于"电脑管家一键加速"——效果立竿见影，对记忆录屏画面几乎无影响（异步执行不阻塞主进程） */
+function trimWorkingSet() {
+  return new Promise((resolve) => {
+    let done = false
+    const finish = (ok) => {
+      if (!done) {
+        done = true
+        resolve(ok)
+      }
+    }
+    try {
+      const cp = spawn(
+        'powershell',
+        [
+          '-NoProfile', '-NonInteractive',
+          '-Command',
+          [
+            "Add-Type -TypeDefinition @\"using System; using System.Diagnostics; using System.Runtime.InteropServices; public class WSet { [DllImport(\"kernel32.dll\")] public static extern bool SetProcessWorkingSetSize(IntPtr h, IntPtr m, IntPtr x); public static void Trim(int pid){ try { var p=Process.GetProcessById(pid); SetProcessWorkingSetSize(p.Handle,(IntPtr)(-1),(IntPtr)(-1)); } catch {} } }\"@",
+            "Get-Process electron -ErrorAction SilentlyContinue | ForEach-Object { [WSet]::Trim($_.Id) }",
+          ].join(' '),
+        ],
+        { windowsHide: true, stdio: 'ignore' },
+      )
+      cp.once('error', () => finish(false))
+      cp.once('exit', (code) => finish(code === 0))
+      setTimeout(() => {
+        if (!done) {
+          try { cp.kill() } catch (_) {}
+          finish(false)
+        }
+      }, 8000)
+    } catch (_) {
+      finish(false)
+    }
+  })
+}
+function startMemWatch() {
+  if (memWatchTimer) return
+  memWatchTimer = setInterval(() => {
+    let total = 0
+    try {
+      for (const m of app.getAppMetrics()) {
+        if (m && m.workingSetSize) total += m.workingSetSize
+      }
+    } catch (_) {}
+    const mb = Math.round(total / 1024 / 1024)
+    if (mb <= MEM_TRIM_MB) {
+      lastTrimTotal = mb
+      return
+    }
+    // 超阈值 → 轻度回收（仅当上一轮已回落，避免连续反复 trim）
+    const now = Date.now()
+    if (now - lastMemTrimAt < 10_000) return
+    lastMemTrimAt = now
+    lastTrimTotal = mb
+    try {
+      // 1) 采集页主动 GC（V8 堆回收，缓冲在磁盘上不受影响）
+      bgSend('gc')
+      // 2) 前台 widget 页面也回收一次
+      if (widgetWindow && !widgetWindow.isDestroyed()) {
+        widgetWindow.webContents.send('recorder:cmd', '__gc__')
+      }
+      // 3) 清 HTTP 会话缓存，释放网络进程占用
+      try {
+        session.defaultSession.clearCache()
+      } catch (_) {}
+      // 4) EmptyWorkingSet：把所有 Electron 进程的工作集踢回页面文件
+      //    （等价"电脑管家一键加速"——效果立竿见影，对记忆录屏画面几乎无影响）
+      trimWorkingSet().then((wsOk) => {
+        logSave(`MEMTRIM total=${mb}MB wsOk=${wsOk} segs=${replaySegs.length} replay=${replayEngine.running}`)
+      })
+      // 5) 隔 600ms 再补一轮 GC
+      setTimeout(() => bgSend('gc'), 600)
+    } catch (_) {}
+  }, 12000)
+}
+
+function startReplayPruneLoop() {
+  stopPruneLoop()
+  pruneReplaySegs()
+  replayPruneTimer = setInterval(pruneReplaySegs, 5000)
+}
+
+/** 磁盘只保留最近 keepSec 的段文件（相对最新段时间，避免跨时钟差异） */
+function pruneReplaySegs() {
+  if (replayExportBusy) return
+  if (!replaySegs.length) return
+  const keepUs = (replayEngine.keepSec || 180) * 1e6
+  const lastEnd = replaySegs[replaySegs.length - 1].endUs
+  while (replaySegs.length > 1 && lastEnd - replaySegs[0].startUs > keepUs + 1e6) {
+    const old = replaySegs.shift()
+    try {
+      fs.unlinkSync(old.file)
+    } catch (_) {}
   }
 }
 
@@ -282,6 +417,7 @@ async function sendReplayStartCfg(cfg) {
       keepSec: cfg.keepSec || 180,
       bitrate: cfg.bitrate || 5_000_000,
       cursorOn,
+      cacheDir: cfg.cacheDir || '',
       sourceId: info.sourceId,
       sourceX: info.sourceX,
       sourceY: info.sourceY,
@@ -317,11 +453,17 @@ function registerBgIpc() {
         refreshTrayMenu()
         pushWidgetState()
       }
+    } else if (d.type === 'seg') {
+      // 一段已落盘：登记并按 keep 窗口清理过期段文件
+      if (d.file && typeof d.startUs === 'number') {
+        replaySegs.push({ file: d.file, startUs: d.startUs, endUs: d.endUs || d.startUs })
+        pruneReplaySegs()
+      }
     } else if (d.type === 'export-done') {
       if (exportResolver) {
         const r = exportResolver
         exportResolver = null
-        r({ ok: !!d.ok, size: d.size || 0, message: d.message || '' })
+        r({ ok: !!d.ok, audioPath: d.audioPath || null, message: d.message || '' })
       }
     }
   })
@@ -337,31 +479,119 @@ function registerBgIpc() {
   })
 }
 
-async function saveReplayAuto() {
-  if (!replayEngine.running && replayEngine.bufferedSec() === 0) {
-    return { saved: false, reason: 'empty', message: '还没有可保存的回放内容' }
+/** ffmpeg 把最近 keepSec 的磁盘段拼成视频文件；返回路径或 null */
+async function assembleReplayVideo() {
+  if (!replaySegs.length) return null
+  pruneReplaySegs()
+  if (!replaySegs.length) return null
+  const tmpDir = path.join(app.getPath('temp'), 'screenrec-cache')
+  fs.mkdirSync(tmpDir, { recursive: true })
+  const base = `replay_${Date.now()}`
+  const listPath = path.join(tmpDir, base + '.txt')
+  const mergedV = path.join(tmpDir, base + '_v.mp4')
+  const esc = (p) => p.replace(/'/g, "'\\''")
+  fs.writeFileSync(listPath, replaySegs.map((s) => `file '${esc(s.file)}'`).join('\n'), 'utf8')
+  let ok = await runFfmpegOk([
+    '-y', '-loglevel', 'error',
+    '-f', 'concat', '-safe', '0',
+    '-i', listPath,
+    '-map', '0:v', '-c:v', 'copy', mergedV,
+  ])
+  if (!ok) {
+    // 兜底：个别段格式不符时重编码（仍很快）
+    ok = await runFfmpegOk([
+      '-y', '-loglevel', 'error',
+      '-f', 'concat', '-safe', '0',
+      '-i', listPath,
+      '-map', '0:v', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p', mergedV,
+    ])
   }
+  try { fs.unlinkSync(listPath) } catch (_) {}
+  if (!ok || !fs.existsSync(mergedV) || fs.statSync(mergedV).size === 0) {
+    try { fs.unlinkSync(mergedV) } catch (_) {}
+    return null
+  }
+  return mergedV
+}
+
+/** 保存失败/过程日志，方便定位（路径、ffmpeg 退出码等） */
+function logSave(msg) {
   try {
-    const tmpDir = path.join(app.getPath('temp'), 'screenrec-cache')
-    fs.mkdirSync(tmpDir, { recursive: true })
-    const tmp = path.join(tmpDir, `replay_${Date.now()}.mp4`)
-    const res = await replayEngine.saveReplay(tmp)
-    if (!res.ok) {
-      try { fs.unlinkSync(tmp) } catch (_) {}
-      return { saved: false, reason: 'convert-error', message: res.message || '导出失败' }
-    }
+    const f = path.join(app.getPath('temp'), 'screenrec-save.log')
+    fs.appendFileSync(f, `${new Date().toISOString()} ${String(msg)}\n`)
+  } catch (_) {}
+}
+
+/** 把最近一次保存的错误详情写到保存目录（用户打开文件夹即可看到），便于排查 */
+function writeSaveDebug(msg) {
+  try {
+    logSave(msg)
     const { getSaveDir } = require('./ipc')
     const dir = getSaveDir()
     fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(
+      path.join(dir, '_screenrec_save_debug.log'),
+      `${new Date().toISOString()} ${String(msg)}\n`,
+      'utf8',
+    )
+  } catch (_) {}
+}
+
+async function saveReplayAuto() {
+  try {
+    const { getSaveDir } = require('./ipc')
+    const dir0 = getSaveDir()
+    writeSaveDebug('BEGIN segs=' + replaySegs.length + ' running=' + replayEngine.running + ' saveDir=' + dir0)
+    if (!replayEngine.running && replaySegs.length === 0) {
+      writeSaveDebug('EMPTY: 回放未运行且无磁盘段（请确认状态栏有「缓冲」计时）')
+      return { saved: false, reason: 'empty', message: '回放缓冲为空：请确认状态栏有「缓冲 xx/xx」走动后再保存' }
+    }
+    replayExportBusy = true
+    // 1) 让采集页把当前 2 秒段完整落盘并导出麦克风音轨（<1s）
+    const ex = await replayEngine.saveReplay('')
+    writeSaveDebug('EXPORT ok=' + ex.ok + ' msg=' + (ex.message || '') + ' segs=' + replaySegs.length)
+    if (!ex.ok) {
+      writeSaveDebug('EXPORT_FAIL: ' + (ex.message || '采集页未回应'))
+      return { saved: false, reason: 'convert-error', message: '导出失败：' + ((ex.message || '采集页未回应，请重试')) }
+    }
+    // 2) 拼接磁盘段为视频（-c copy 无损，秒级）
+    const mergedV = await assembleReplayVideo()
+    if (!mergedV) {
+      writeSaveDebug('ASSEMBLE_FAIL: 无可用画面段（segs=' + replaySegs.length + '）ffmpeg 拼接失败')
+      return { saved: false, reason: 'convert-error', message: '画面拼接失败：没有可用的缓冲画面，请确认回放正在缓冲后重试' }
+    }
+    // 3) 若有麦克风音轨则并入
+    const tmpDir = path.dirname(mergedV)
+    const vaPath = path.join(tmpDir, `replay_${Date.now()}_va.mp4`)
+    let videoPath = mergedV
+    if (ex.audioPath) {
+      const okA = await runFfmpegOk([
+        '-y', '-loglevel', 'error',
+        '-i', mergedV, '-i', ex.audioPath,
+        '-map', '0:v', '-map', '1:a',
+        '-c:v', 'copy', '-c:a', 'aac', '-b:a', '160k', vaPath,
+      ])
+      try { fs.unlinkSync(ex.audioPath) } catch (_) {}
+      if (okA) videoPath = vaPath
+    }
+    // 4) 落到保存目录；有系统声则混入
+    const dir = dir0
+    fs.mkdirSync(dir, { recursive: true })
     const target = path.join(dir, replayFileName())
-    // 优先混入系统声音；无立体声混音时直接用原片
-    const merged = await mergeSysAudio(tmp, target)
-    if (!merged) fs.copyFileSync(tmp, target)
-    try { fs.unlinkSync(tmp) } catch (_) {}
+    writeSaveDebug('TARGET ' + target)
+    const merged = await mergeSysAudio(videoPath, target)
+    if (!merged) fs.copyFileSync(videoPath, target)
+    for (const f of [mergedV, vaPath]) {
+      try { fs.unlinkSync(f) } catch (_) {}
+    }
     const size = fs.statSync(target).size
+    writeSaveDebug('OK size=' + size + ' path=' + target)
     return { saved: true, path: target, size }
   } catch (err) {
-    return { saved: false, reason: 'error', message: err.message }
+    writeSaveDebug('ERR ' + (err && err.stack ? err.stack : err))
+    return { saved: false, reason: 'error', message: '保存失败：' + ((err && err.message) || String(err)) }
+  } finally {
+    replayExportBusy = false
   }
 }
 
@@ -369,11 +599,16 @@ async function startReplay({ keepSec, fps, bitrate }) {
   if (CLOSE_BLOCK_STATES.includes(manual.state)) {
     return { ok: false, message: '正在手动录制，请先停止后再开启记忆回放' }
   }
+  // 全新一轮：清空上次遗留缓存段
+  clearReplayCacheDir()
+  replaySegs = []
+  fs.mkdirSync(replayCachePath(), { recursive: true })
   ensureCaptureWindow()
   const res = await replayEngine.start({ keepSec, fps, bitrate })
-  sendReplayStartCfg({ keepSec, fps, bitrate })
+  sendReplayStartCfg({ keepSec, fps, bitrate, cacheDir: replayCachePath() })
   // 系统声音旁路（检测不到立体声混音则自动忽略）
   startSysAudio(keepSec || 180)
+  startReplayPruneLoop()
   refreshTrayMenu()
   pushWidgetState()
   return res
@@ -383,17 +618,22 @@ async function stopReplay() {
   await replayEngine.stop()
   stopSysAudio()
   if (captureWin) bgSend('stop')
+  stopPruneLoop()
   refreshCursorPolling()
   refreshTrayMenu()
   pushWidgetState()
-  // 稍后回收隐藏窗口，让内存回到最低
+  // 稍后回收隐藏窗口并清空磁盘分段，让内存/磁盘回到最低
   setTimeout(() => {
-    if (!replayEngine.running) destroyCaptureWindow()
+    if (!replayEngine.running) {
+      destroyCaptureWindow()
+      clearReplayCacheDir()
+      replaySegs = []
+    }
   }, 800)
   return { ok: true }
 }
 
-/** 从设置读取回放参数（默认 3 分钟 · 1080P · 12fps） */
+/** 从设置读取回放参数（设置是什么就用什么，不做自动降档） */
 function replayCfgFromSettings() {
   let keepMin = 3
   let replayQuality = '1080p'
@@ -567,9 +807,14 @@ function runFfmpegOk(args) {
     p.stderr.on('data', (d) => {
       err = (err + String(d)).slice(-400)
     })
-    p.once('error', () => resolve(false))
+    p.once('error', (e) => {
+      logSave('FFMPEG spawn error ' + (e && e.message) + ' args=' + JSON.stringify(args).slice(0, 300))
+      resolve(false)
+    })
     p.once('exit', (code) => {
-      resolve(code === 0 && fs.existsSync(args[args.length - 1]) && fs.statSync(args[args.length - 1]).size > 0)
+      const outOk = code === 0 && fs.existsSync(args[args.length - 1]) && fs.statSync(args[args.length - 1]).size > 0
+      if (!outOk) logSave('FFMPEG exit=' + code + ' err=' + err + ' args=' + JSON.stringify(args).slice(0, 300))
+      resolve(outOk)
     })
   })
 }
@@ -583,7 +828,8 @@ async function mergeSysAudio(videoPath, outPath) {
     const wavTmp = path.join(base, `sys_${Date.now()}.wav`)
     const concatInputs = []
     const concatMap = []
-    for (const s of segs.slice(-90)) {
+    const sysCount = Math.max(1, Math.ceil((replayEngine.keepSec || 180) / sysAudioState.segSeconds) + 1)
+    for (const s of segs.slice(-sysCount)) {
       concatInputs.push('-i', s)
       concatMap.push(`[${concatMap.length}:a]`)
     }
@@ -793,6 +1039,7 @@ function registerWidgetAndSettingsIpc() {
           keepMin: 3,
           replayQuality: '1080p',
           replayFps: 12,
+          replayCacheDir: '',
           sysAudio: false,
           replaySysAudio: true,
           cursorOn: true,
@@ -857,7 +1104,15 @@ function registerWidgetAndSettingsIpc() {
     }
   })
   ipcMain.on('widget:hide', () => {
-    if (widgetWindow && !widgetWindow.isDestroyed()) widgetWindow.hide()
+    if (CLOSE_BLOCK_STATES.includes(manual.state)) {
+      // 录制中不能销毁（需按钮停止），仅隐藏
+      if (widgetWindow && !widgetWindow.isDestroyed()) widgetWindow.hide()
+      return
+    }
+    // 收进托盘：彻底销毁 widget 渲染进程，后台占用降到最低；
+    // 托盘「显示捕获工具」/ 双击托盘 / Ctrl+Alt+G / 再次启动 都会重建唤出
+    if (widgetWindow && !widgetWindow.isDestroyed()) widgetWindow.destroy()
+    widgetWindow = null
   })
   ipcMain.handle('replay:toggle-auto', () => toggleReplayEngine())
   // 通用回放控制（供 UI / 全局调用）
@@ -931,6 +1186,7 @@ app.whenReady().then(() => {
   } catch (_) {}
 
   createTray()
+  startMemWatch()
   if (!AUTO_HIDDEN) {
     // 正常模式：启动 widget 窗口（主交互）
     createWidgetWindow()
@@ -960,7 +1216,9 @@ app.whenReady().then(() => {
 })
 
 app.on('window-all-closed', () => {
-  if (!replayEngine.running && !process.env.SCREENREC_SELF_TEST) app.quit()
+  // widget 收进托盘时已被销毁 → 不能因此退出；保持托盘常驻，退出只能走托盘「退出」
+  if (!process.env.SCREENREC_SELF_TEST) return
+  app.quit()
 })
 
 app.on('will-quit', () => {

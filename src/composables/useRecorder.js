@@ -180,6 +180,15 @@ export function useRecorder() {
           toast('请先开始录制再切换麦克风', 'info')
         }
         break
+      case '__gc__':
+        // 主进程内存看护触发：主动回收本页 V8 堆
+        if (typeof window.gc === 'function') {
+          try { window.gc() } catch (_) {}
+          setTimeout(() => {
+            try { window.gc() } catch (_) {}
+          }, 600)
+        }
+        break
     }
   }
 

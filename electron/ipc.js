@@ -23,12 +23,31 @@ function writeSettings(patch) {
   } catch (_) {}
 }
 
-/** 默认保存目录（未设置时 = 视频/录屏） */
+/** 保存目录：设置里填什么就用什么（不存在则自动创建）；完全未设置才用默认 D:\录屏 */
 function getSaveDir() {
   const custom = readSettings().saveDir
-  if (custom && fs.existsSync(custom)) return custom
-  const def = path.join(app.getPath('videos'), '录屏')
-  return def
+  if (custom && typeof custom === 'string' && custom.trim()) {
+    // 以设置里的路径为准：目录不存在就自动创建，创建成功即生效
+    try {
+      fs.mkdirSync(custom, { recursive: true })
+      if (fs.existsSync(custom)) return custom
+    } catch (_) {}
+  }
+  // 未设置或创建失败时回退默认：
+  // 便携版 → exe 同目录/录像；普通版 → D:\录屏；都不可用 → 系统视频目录
+  if (process.env.PORTABLE_EXECUTABLE_DIR) {
+    const pd = path.join(process.env.PORTABLE_EXECUTABLE_DIR, '录像')
+    try {
+      fs.mkdirSync(pd, { recursive: true })
+    } catch (_) {}
+    if (fs.existsSync(pd)) return pd
+  }
+  const def = 'D:\\录屏'
+  try {
+    fs.mkdirSync(def, { recursive: true })
+  } catch (_) {}
+  if (fs.existsSync(def)) return def
+  return path.join(app.getPath('videos'), '录屏')
 }
 
 function tempDir() {
@@ -190,6 +209,17 @@ function registerIpc({ setState } = {}) {
     if (canceled || !filePaths || !filePaths.length) return { changed: false, dir: getSaveDir() }
     writeSettings({ saveDir: filePaths[0] })
     return { changed: true, dir: filePaths[0] }
+  })
+
+  // 通用文件夹选择（只返回路径不写设置，供回放缓存位置等使用）
+  ipcMain.handle('dir:choose', async (e) => {
+    const win = BrowserWindowOf(e)
+    const { canceled, filePaths } = await dialog.showOpenDialog(win, {
+      title: '选择文件夹',
+      properties: ['openDirectory', 'createDirectory'],
+    })
+    if (canceled || !filePaths || !filePaths.length) return { dir: null }
+    return { dir: filePaths[0] }
   })
 
   // 在资源管理器中显示文件

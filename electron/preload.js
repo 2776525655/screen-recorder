@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld('screenRec', {
   getSources: () => ipcRenderer.invoke('sources:list'),
   getSaveDir: () => ipcRenderer.invoke('save:get-dir'),
   chooseSaveDir: () => ipcRenderer.invoke('save:choose-dir'),
+  chooseFolder: () => ipcRenderer.invoke('dir:choose'),
   showInFolder: (filePath) => ipcRenderer.invoke('path:show', filePath),
   openSoundPanel: () => ipcRenderer.invoke('sound:panel'),
   diskFree: (p) => ipcRenderer.invoke('disk:free', p),

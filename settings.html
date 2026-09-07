@@ -152,6 +152,14 @@
           <span class="tip">需系统已启用「立体声混音」录音设备；未检测到时自动只录麦克风</span>
         </div>
       </div>
+      <div class="row">
+        <div class="label">回放缓存位置</div>
+        <div class="ctl">
+          <span class="value" id="replayCacheDirText">…</span>
+          <button class="btn" id="chooseReplayCache">更改…</button>
+          <span class="tip">记忆回放的临时分段文件（自动循环清理）；默认在 C 盘，改到 D 盘等可省系统盘空间</span>
+        </div>
+      </div>
     </div>
   </div>
   <div class="save-bar">
@@ -169,6 +177,7 @@
     keepMin: 3,
     replayQuality: '1080p',
     replayFps: 12,
+    replayCacheDir: '',
     cursorOn: true,
     replaySysAudio: true,
     autoStart: false,
@@ -184,6 +193,7 @@
     $('keepMin').value = String(settings.keepMin)
     $('replayQuality').value = settings.replayQuality || '1080p'
     $('replayFps').value = String(settings.replayFps || 12)
+    $('replayCacheDirText').textContent = settings.replayCacheDir || '（C 盘系统默认）'
     $('autoStartSwitch').classList.toggle('on', !!settings.autoStart)
     $('cursorSwitch').classList.toggle('on', settings.cursorOn !== false)
     $('replaySysSwitch').classList.toggle('on', settings.replaySysAudio !== false)
@@ -194,6 +204,14 @@
     if (r && r.dir) {
       settings.saveDir = r.dir
       $('saveDir').textContent = r.dir
+    }
+  }
+
+  async function pickReplayCache() {
+    const r = await window.screenRec.chooseFolder()
+    if (r && r.dir) {
+      settings.replayCacheDir = r.dir
+      $('replayCacheDirText').textContent = r.dir
     }
   }
 
@@ -225,6 +243,7 @@
   $('cancelBtn').addEventListener('click', () => window.screenRec.settingsClose())
   $('saveBtn').addEventListener('click', save)
   $('chooseDir').addEventListener('click', pickDir)
+  $('chooseReplayCache').addEventListener('click', pickReplayCache)
   $('autoStartSwitch').addEventListener('click', () => $('autoStartSwitch').classList.toggle('on'))
   $('cursorSwitch').addEventListener('click', () => $('cursorSwitch').classList.toggle('on'))
   $('replaySysSwitch').addEventListener('click', () => $('replaySysSwitch').classList.toggle('on'))

@@ -1,19 +1,20 @@
 /**
- * 后台记忆回放引擎（Xbox 式 · DXGI 桌面流 + WebCodecs 内存环形缓冲）
- * - 与手动录屏同底层（Chromium 桌面流），gdigrab 无关 → 不会让系统鼠标闪烁
- * - 编码后的 H.264 帧只放内存环形缓冲（最近 N 秒），不做磁盘分段
- * - 点击保存时才用 mp4-muxer 把环形缓冲合成为 MP4 文件
- * - 可选把系统鼠标箭头叠加进画面（默认开）
+ * 后台记忆回放引擎（Xbox 式 · DXGI 桌面流 + WebCodecs）
+ * 磁盘分段版：画面按 2 秒关键帧边界切成独立 mp4 小段落盘（video-only），
+ * 内存只保留「当前 2 秒段」+ 很小的音频环；导出时主进程 ffmpeg 无损拼接。
+ * - 不再把最近 N 分钟的视频驻留内存 → 后台内存恒定，不随运行时间增长
+ * - 系统鼠标箭头叠加、麦克风采集逻辑保持不变
  */
 import { Muxer, StreamTarget } from 'mp4-muxer'
 
 const screenRec = window.screenRec
-const KEY_MS = 2000
+const KEY_MS = 2000 // 关键帧间隔 = 段长
 const AVC_CANDIDATES = ['avc1.42001f', 'avc1.4d0028', 'avc1.640028']
 
 let cfg = null
 let active = false
 let stopping = false
+let exporting = false
 
 let srcStream = null
 let videoEl = null
@@ -28,10 +29,17 @@ let rafId = 0
 let clockStart = 0
 let lastKeyUs = -Infinity
 
-const ring = [] // { tsUs, chunk }
+// —— 磁盘分段状态 ——
+let segSeq = 0
+let segStartUs = 0 // 当前段第一帧 tsUs
+let segEndUs = 0 // 当前段已见到的最后一帧 tsUs
+let curSeg = [] // { tsUs, chunk, meta }，最多 ~2s 帧
+const segList = [] // 已落盘段元数据（内存轻量，供 bufferedSec 统计）
 let metaTimer = null
+let gcTimer = null
+let writing = Promise.resolve() // 串行化写盘链
 
-// —— 麦克风音频（与画面同源进缓冲） ——
+// —— 麦克风音频（内存小环，导出时写入 m4a） ——
 const audioRing = [] // { tsUs, chunk }
 let aenc = null
 let aMeta = null
@@ -56,13 +64,17 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms))
 }
 
-async function pickAvc(width, height, bitrate) {
+function segPath(seq) {
+  return (cfg.cacheDir || '') + '/seg_' + String(seq).padStart(6, '0') + '.mp4'
+}
+
+async function pickAvc(w, h, bitrate) {
   for (const codec of AVC_CANDIDATES) {
     try {
       const r = await VideoEncoder.isConfigSupported({
         codec,
-        width,
-        height,
+        width: w,
+        height: h,
         bitrate,
         avc: { format: 'avc' },
       })
@@ -98,16 +110,95 @@ async function openStream(fps) {
   return { stream, vt }
 }
 
-function ringBufferedSec() {
-  if (!ring.length) return 0
-  const first = ring[0].tsUs
-  const last = ring[ring.length - 1].tsUs
-  return Math.max(0, Math.min(cfg.keepSec, (last - first) / 1e6))
+// —— 缓冲时长（按已落盘段 + 当前段估算） ——
+function bufferedSec() {
+  let start = Infinity
+  let end = 0
+  if (segList.length) {
+    start = Math.min(start, segList[0].startUs)
+    end = Math.max(end, segList[segList.length - 1].endUs)
+  }
+  if (curSeg.length) {
+    start = Math.min(start, segStartUs)
+    end = Math.max(end, segEndUs)
+  }
+  if (!isFinite(start) || end <= start) return 0
+  return Math.max(0, Math.min(cfg.keepSec, (end - start) / 1e6))
 }
 
-function pruneRing() {
+function sendMeta() {
+  screenRec.bgMeta({
+    type: 'state',
+    active: active && !!enc,
+    bufferedSec: Math.round(bufferedSec()),
+  })
+}
+
+/** 把一段快照写入独立 mp4（随机偏移写，mp4-muxer 直接产出可独立播放的小文件） */
+function writeSegment(chunks, startUs, endUs) {
+  const filePath = segPath(segSeq++)
+  return screenRec
+    .bgMkFile({ filePath })
+    .then((mk) => {
+      if (!mk || !mk.ok) throw new Error('创建段文件失败')
+      return new Promise((resolve, reject) => {
+        try {
+          const state = { bytes: 0, p: Promise.resolve() }
+          const muxer = new Muxer({
+            target: new StreamTarget({
+              onData: (d, position) => {
+                const buf = d.slice()
+                const off = typeof position === 'number' && position >= 0 ? position : state.bytes
+                state.bytes = Math.max(state.bytes, off + buf.byteLength)
+                state.p = state.p
+                  .then(() => screenRec.recTempAppend({ filePath, offset: off, data: buf }))
+                  .catch(() => {})
+              },
+              chunked: true,
+              chunkSize: 2 * 1024 * 1024,
+            }),
+            video: { codec: 'avc', width, height },
+            fastStart: false,
+            firstTimestampBehavior: 'offset',
+          })
+          let firstDecoder = null
+          for (const item of chunks) {
+            if (!firstDecoder && item.meta && item.meta.decoderConfig) {
+              firstDecoder = item.meta.decoderConfig
+            }
+            try {
+              muxer.addVideoChunk(item.chunk, {
+                decoderConfig: firstDecoder,
+                ccs: item.meta ? item.meta.ccs : undefined,
+              })
+            } catch (_) {}
+          }
+          try {
+            muxer.finalize()
+          } catch (_) {}
+          state.p.then(resolve).catch(reject)
+        } catch (e) {
+          reject(e)
+        }
+      })
+    })
+    .then(() => {
+      segList.push({ file: filePath, startUs, endUs })
+      pruneSegList()
+      // 通知主进程登记这段（供导出拼接 / 清理磁盘）
+      screenRec.bgMeta({ type: 'seg', file: filePath, startUs, endUs, seq: segSeq - 1 })
+    })
+    .catch((e) => {
+      log('分段落盘失败：' + (e && e.message))
+    })
+}
+
+/** 主进程只保留最近 keepSec 的段文件（本端仅删元数据；磁盘由主进程清理） */
+function pruneSegList() {
   const keepUs = cfg.keepSec * 1e6
-  while (ring.length > 1 && ring[ring.length - 1].tsUs - ring[0].tsUs > keepUs) ring.shift()
+  while (segList.length > 1 && segList[segList.length - 1].endUs - segList[0].startUs > keepUs) {
+    segList.shift()
+  }
 }
 
 function pruneAudioRing() {
@@ -220,14 +311,6 @@ async function closeAudio() {
   audioEnabled = false
 }
 
-function sendMeta() {
-  screenRec.bgMeta({
-    type: 'state',
-    active: active && !!enc,
-    bufferedSec: Math.round(ringBufferedSec()),
-  })
-}
-
 function drawCursorArrow() {
   if (!cursor.on || !c2d) return
   const x = cursor.x - (cfg.sourceX || 0)
@@ -252,8 +335,26 @@ function drawCursorArrow() {
   c2d.restore()
 }
 
+/** 关闭当前段：把已积累的帧（到最新关键帧前）写成独立 mp4 */
+function closeCurrentSegment() {
+  if (!curSeg.length) return Promise.resolve()
+  const chunks = curSeg
+  const startUs = segStartUs
+  const endUs = segEndUs
+  curSeg = []
+  segStartUs = 0
+  segEndUs = 0
+  writing = writing.then(() => writeSegment(chunks, startUs, endUs))
+  return writing.catch(() => {})
+}
+
 function tick() {
   if (!active || stopping) return
+  if (exporting) {
+    // 导出期间跳过取帧，但保持 rVFC 循环，导出结束后立即恢复
+    rafId = videoEl.requestVideoFrameCallback(tick)
+    return
+  }
   const tsUs = Math.round((performance.now() - clockStart) * 1000)
   let frame = null
   if (cfg.cursorOn && canvas) {
@@ -272,28 +373,45 @@ function tick() {
       return
     }
   }
-  const key = tsUs - lastKeyUs >= KEY_MS * 1000
-  if (key) lastKeyUs = tsUs
   try {
-    enc.encode(frame, { keyFrame: key })
+    enc.encode(frame, { keyFrame: tsUs - lastKeyUs >= KEY_MS * 1000 })
   } catch (_) {}
   frame.close()
   rafId = videoEl.requestVideoFrameCallback(tick)
 }
 
+function onVideoChunk(chunk, meta) {
+  if (!active) return
+  lastMeta = meta
+  if (chunk.key && curSeg.length) {
+    // 新关键帧 = 上一段结束边界 → 先落盘上一段
+    closeCurrentSegment()
+  }
+  if (!curSeg.length) {
+    segStartUs = chunk.timestamp
+    segEndUs = chunk.timestamp
+  }
+  segEndUs = Math.max(segEndUs, chunk.timestamp)
+  curSeg.push({ tsUs: chunk.timestamp, chunk, meta })
+}
+
 async function startEngine(c) {
   stopping = false
+  exporting = false
   active = true
   cfg = {
     fps: c.fps || 12,
     bitrate: c.bitrate || 6_000_000,
     keepSec: c.keepSec || 180,
+    cacheDir: c.cacheDir || '',
     cursorOn: c.cursorOn !== false,
     sourceId: c.sourceId || '',
     sourceX: c.sourceX || 0,
     sourceY: c.sourceY || 0,
   }
-  ring.length = 0
+  segSeq = 0
+  segList.length = 0
+  curSeg.length = 0
   audioRing.length = 0
   audioFrames = 0
   clockStart = 0
@@ -321,7 +439,6 @@ async function startEngine(c) {
         }, 3000)
       }).catch(() => {})
     }
-    // 取真实帧尺寸
     let fw = 0
     let fh = 0
     for (let i = 0; i < 30 && !fw; i++) {
@@ -351,11 +468,7 @@ async function startEngine(c) {
     const avc = await pickAvc(width, height, cfg.bitrate)
     if (!avc) throw new Error('当前设备不支持 H.264 编码')
     enc = new VideoEncoder({
-      output: (chunk, meta) => {
-        lastMeta = meta
-        ring.push({ tsUs: chunk.timestamp, chunk, meta })
-        pruneRing()
-      },
+      output: onVideoChunk,
       error: () => {},
     })
     enc.configure({
@@ -369,9 +482,17 @@ async function startEngine(c) {
     clockStart = performance.now()
     await setupMicAudio()
     metaTimer = setInterval(sendMeta, 1000)
+    // 渲染页长时间工作 V8 堆会缓慢膨胀（DXGI 帧对象、canvas 等），定期 GC 稳住
+    if (typeof window.gc === 'function') {
+      gcTimer = setInterval(() => {
+        try {
+          window.gc()
+        } catch (_) {}
+      }, 20000)
+    }
     sendMeta()
     rafId = videoEl.requestVideoFrameCallback(tick)
-    log('引擎启动 fps=' + cfg.fps + ' ' + width + 'x' + height + ' cursor=' + cfg.cursorOn + ' mic=' + audioEnabled)
+    log('引擎启动(磁盘分段) fps=' + cfg.fps + ' ' + width + 'x' + height + ' cache=' + cfg.cacheDir + ' mic=' + audioEnabled)
   } catch (e) {
     log('启动失败：' + (e && e.message))
     active = false
@@ -418,103 +539,84 @@ async function cleanupStream() {
     clearInterval(metaTimer)
     metaTimer = null
   }
+  if (gcTimer) {
+    clearInterval(gcTimer)
+    gcTimer = null
+  }
+  // 停止：丢弃未落盘段，磁盘清理由主进程负责
+  curSeg.length = 0
+  segList.length = 0
 }
 
 async function stopEngine() {
   stopping = true
   active = false
   await cleanupStream()
-  ring.length = 0
   screenRec.bgMeta({ type: 'state', active: false, bufferedSec: 0 })
   log('引擎停止')
 }
 
-// —— 导出：把环形缓冲合成 MP4 文件 ——
-async function doExport(filePath) {
+// —— 导出：落盘最后一段 → 麦克风环写 m4a → 通知主进程 ffmpeg 拼接 ——
+async function doExport(_filePath) {
+  exporting = true
   const done = (ok, extra = {}) => {
-    screenRec.bgMeta({ type: 'export-done', ok, filePath, ...extra })
+    exporting = false
+    screenRec.bgMeta({ type: 'export-done', ok, ...extra })
   }
   try {
-    if (!ring.length) return done(false, { message: '暂无缓冲内容' })
-    const mk = await screenRec.bgMkFile({ filePath })
-    if (!mk || !mk.ok) return done(false, { message: '无法创建输出文件' })
+    // 1) 冲刷编码器，把当前 2 秒段也完整落盘（保证最近画面在）
+    if (enc) {
+      try { await enc.flush() } catch (_) {}
+    }
+    await closeCurrentSegment()
+    await writing.catch(() => {})
 
-    const keepUs = cfg.keepSec * 1e6
-    const last = ring[ring.length - 1].tsUs
-    const cut = Math.max(0, last - keepUs)
-    const data = ring.filter((r) => r.tsUs >= cut)
-    if (!data.length) return done(false, { message: '暂无可用帧' })
-
-    // 取同窗口的音频（若有麦克风）
-    let audioData = []
-    if (audioEnabled && aenc) {
+    // 2) 麦克风 → 音频 m4a（独立小文件，主进程随后并入）
+    let audioPath = null
+    let audioSize = 0
+    if (audioEnabled && aenc && audioRing.length) {
       try { await aenc.flush() } catch (_) {}
-    }
-    if (audioEnabled && audioRing.length) {
-      const alast = audioRing[audioRing.length - 1].tsUs
-      const acut = Math.max(0, alast - keepUs)
-      audioData = audioRing.filter((a) => a.tsUs >= acut)
-    }
-
-    const w = width
-    const h = height
-    const state = { bytes: 0, p: Promise.resolve() }
-    const realMuxer = new Muxer({
-      target: new StreamTarget({
-        onData: (d, position) => {
-          const buf = d.slice()
-          const off = typeof position === 'number' && position >= 0 ? position : state.bytes
-          state.bytes = Math.max(state.bytes, off + buf.byteLength)
-          state.p = state.p
-            .then(() => screenRec.recTempAppend({ filePath, offset: off, data: buf }))
-            .catch(() => {})
-        },
-        chunked: true,
-        chunkSize: 4 * 1024 * 1024,
-      }),
-      video: { codec: 'avc', width: w, height: h },
-      ...(audioData.length ? { audio: { codec: 'aac', numberOfChannels: 1, sampleRate: audioRate } } : {}),
-      fastStart: false,
-      firstTimestampBehavior: 'offset',
-    })
-
-    let firstDecoder = null
-    for (const item of data) {
-      if (!firstDecoder && item.meta && item.meta.decoderConfig) {
-        firstDecoder = item.meta.decoderConfig
-      }
-      try {
-        realMuxer.addVideoChunk(item.chunk, {
-          decoderConfig: firstDecoder,
-          ccs: item.meta ? item.meta.ccs : undefined,
+      const data = audioRing.slice()
+      const mk = await screenRec.recTempCreate()
+      audioPath = mk && mk.filePath ? mk.filePath : null
+      if (audioPath) {
+        const state = { bytes: 0, p: Promise.resolve() }
+        const amux = new Muxer({
+          target: new StreamTarget({
+            onData: (d, position) => {
+              const buf = d.slice()
+              const off = typeof position === 'number' && position >= 0 ? position : state.bytes
+              state.bytes = Math.max(state.bytes, off + buf.byteLength)
+              state.p = state.p
+                .then(() => screenRec.recTempAppend({ filePath: audioPath, offset: off, data: buf }))
+                .catch(() => {})
+            },
+            chunked: true,
+            chunkSize: 2 * 1024 * 1024,
+          }),
+          audio: { codec: 'aac', numberOfChannels: 1, sampleRate: audioRate },
+          fastStart: false,
+          firstTimestampBehavior: 'offset',
         })
-      } catch (_) {}
+        for (const item of data) {
+          try {
+            amux.addAudioChunk(item.chunk, { decoderConfig: aMeta ? aMeta.decoderConfig : undefined })
+          } catch (_) {}
+        }
+        try {
+          amux.finalize()
+        } catch (_) {}
+        await state.p.catch(() => {})
+        const st = await screenRec.recTempStat({ filePath: audioPath }).catch(() => ({ size: 0 }))
+        audioSize = st && st.size ? st.size : 0
+        if (!audioSize) {
+          try { await screenRec.recTempRemove({ filePath: audioPath }) } catch (_) {}
+          audioPath = null
+        }
+      }
     }
-    let firstAdec = null
-    for (const item of audioData) {
-      if (!firstAdec && aMeta && aMeta.decoderConfig) firstAdec = aMeta.decoderConfig
-      try {
-        realMuxer.addAudioChunk(item.chunk, { decoderConfig: firstAdec })
-      } catch (_) {}
-    }
-    try {
-      realMuxer.finalize()
-    } catch (_) {}
-    await state.p.catch(() => {})
-    // 等待文件索引(moov)真正落盘，避免主进程复制到残缺文件
-    let hasMoov = false
-    for (let i = 0; i < 20 && !hasMoov; i++) {
-      const h = await screenRec.recTempHasMoov({ filePath }).catch(() => ({ hasMoov: false }))
-      hasMoov = !!(h && h.hasMoov)
-      if (!hasMoov) await sleep(120)
-    }
-    if (!hasMoov) {
-      log('导出异常：moov 未落盘')
-      return done(false, { message: '导出未完成（文件索引缺失），请重试' })
-    }
-    const st = await screenRec.recTempStat({ filePath }).catch(() => ({ size: 0 }))
-    done(true, { size: st && st.size ? st.size : 0 })
-    log('导出完成 size=' + (st && st.size))
+    done(true, { audioPath, audioSize })
+    log('导出就绪（分段已齐，mic=' + (audioPath ? audioSize : 0) + '）')
   } catch (e) {
     log('导出失败：' + (e && e.message))
     done(false, { message: String((e && e.message) || e) })
@@ -526,6 +628,15 @@ screenRec.onBgCmd((d) => {
   if (!d) return
   if (d.type === 'start') startEngine(d)
   else if (d.type === 'stop') stopEngine()
+  else if (d.type === 'gc') {
+    // 主进程内存看护触发：主动回收 V8 堆（记忆录屏缓冲在磁盘，不受影响）
+    if (typeof window.gc === 'function') {
+      try { window.gc() } catch (_) {}
+      setTimeout(() => {
+        try { window.gc() } catch (_) {}
+      }, 600)
+    }
+  }
   else if (d.type === 'export') doExport(d.filePath)
   else if (d.type === 'cursor') {
     cursor.on = true
