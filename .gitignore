@@ -1,0 +1,9 @@
+node_modules/
+dist/
+dist-electron/
+release/
+*.log
+.DS_Store
+
+# ffmpeg 运行时依赖(78MB)不入库，需自行下载放到 bin/
+bin/ffmpeg.exe

@@ -1,0 +1,33 @@
+appId: com.screenrec.app
+productName: ScreenRec
+copyright: Copyright © 2026 ScreenRec
+directories:
+  output: release
+  buildResources: build
+
+# 运行时不需要完整 node_modules（前端/主进程均已 bundle），只打进必要文件
+files:
+  - dist/**
+  - dist-electron/**
+  - package.json
+  - node_modules/koffi/**
+  - "!**/*.map"
+
+# koffi 含原生 .node，必须解包到 asar 外才能被 Electron 加载
+asarUnpack:
+  - node_modules/koffi/**
+  - node_modules/@koromix/**
+
+# ffmpeg 必须放在 asar 外部，子进程才能直接执行
+extraResources:
+  - from: bin/ffmpeg.exe
+    to: bin/ffmpeg.exe
+
+win:
+  target:
+    - target: portable
+      arch: [x64]
+  requestedExecutionLevel: asInvoker
+
+portable:
+  artifactName: ScreenRec-${version}-portable.exe

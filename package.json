@@ -1,0 +1,27 @@
+{
+  "name": "screen-recorder",
+  "productName": "屏刻 ScreenRec",
+  "version": "0.6.0",
+  "description": "深色专业风桌面录屏工具：手动录制 + Xbox 式记忆回放",
+  "private": true,
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "start": "electron .",
+    "dist": "electron-builder --win nsis portable",
+    "dist:portable": "electron-builder --win portable"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.8",
+    "electron": "^44.2.0",
+    "electron-builder": "^26.0.0",
+    "mp4-muxer": "^5.2.2",
+    "vite": "^8.2.2",
+    "vite-plugin-electron": "^1.1.2",
+    "vue": "^3.5.13"
+  },
+  "dependencies": {
+    "koffi": "^3.2.1"
+  }
+}

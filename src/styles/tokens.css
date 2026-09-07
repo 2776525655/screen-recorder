@@ -1,0 +1,42 @@
+/* ============ 屏刻 ScreenRec 设计变量（深色专业风） ============ */
+:root {
+  /* 背景层级（亮度递进） */
+  --bg-base: #16181d;
+  --bg-panel: #1e2128;
+  --bg-card: #252933;
+  --bg-hover: #2c313d;
+  --bg-active: #343a48;
+  --bg-input: #1a1d24;
+
+  /* 描边 */
+  --border-subtle: #2a2f39;
+  --border-default: #3a4150;
+  --border-strong: #4a5366;
+
+  /* 文字 */
+  --text-primary: #e9ebf2;
+  --text-secondary: #a6aebc;
+  --text-muted: #6b7485;
+
+  /* 强调 */
+  --accent: #4c7cf0;
+  --accent-hover: #5e8bf7;
+  --accent-soft: rgba(76, 124, 240, 0.14);
+
+  /* 语义 */
+  --danger: #f0483e;
+  --danger-soft: rgba(240, 72, 62, 0.12);
+  --success: #2ebd85;
+  --warning: #e6a23c;
+  --rec-red: #ff5148;
+
+  /* 尺寸 */
+  --titlebar-h: 44px;
+  --sidebar-w: 232px;
+  --radius-control: 6px;
+  --radius-card: 10px;
+  --radius-modal: 12px;
+
+  --shadow-float: 0 8px 24px rgba(0, 0, 0, 0.45);
+  --font-family: 'Microsoft YaHei UI', 'PingFang SC', 'Segoe UI', sans-serif;
+}
